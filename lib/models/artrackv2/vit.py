@@ -383,7 +383,7 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
             model.load_pretrained(pretrained, prefix='')
         else:
             checkpoint = torch.load(pretrained, map_location="cpu")
-            missing_keys, unexpected_keys = model.load_state_dict(checkpoint["model"], strict=False)
+            missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
             print('Load pretrained model from: ' + pretrained)
 
     return model
@@ -402,4 +402,9 @@ def vit_large_patch16_224(pretrained=False, bins=400, range=2, extension=3, **kw
     model_kwargs = dict(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, bins=bins, range_time=range, extension=extension, **kwargs)
     model = _create_vision_transformer('vit_large_patch16_224_in21k', pretrained=pretrained, **model_kwargs)
+    return model
+def vit_small_patch16_224(pretrained=False, bins=400, range=2, extension=3, **kwargs):
+    model_kwargs = dict(
+        patch_size=16, embed_dim=384, depth=12, num_heads=6, bins=bins, range_time=range, extension=extension, **kwargs)
+    model = _create_vision_transformer('vit_small_patch16_224_in21k', pretrained=pretrained, **model_kwargs)
     return model

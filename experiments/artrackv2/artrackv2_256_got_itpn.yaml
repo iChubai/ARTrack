@@ -36,15 +36,18 @@ MODEL:
   BINS: 400
   RANGE: 2
   EXTENSION: 3
-  PRETRAIN_FILE: "dino_deitsmall16_pretrain.pth"
+  PRETRAIN_FILE: "fast_itpn_tiny_1600e_1k.pt"
   EXTRA_MERGER: False
   RETURN_INTER: False
   BACKBONE:
-    TYPE: vit_small_patch16_224
+    TYPE: fastitpnt
     STRIDE: 16
+    POS_TYPE: index  # index or interpolate
+    GRAD_CKPT: False
   HEAD:
     TYPE: PIX
-    NUM_CHANNELS: 384
+    NUM_CHANNELS: 768
+    
 TRAIN:
   BACKBONE_MULTIPLIER: 0.1
   DROP_PATH_RATE: 0.1

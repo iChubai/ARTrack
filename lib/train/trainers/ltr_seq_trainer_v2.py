@@ -70,8 +70,11 @@ class LTRSeqTrainerV2(BaseTrainer):
 
     def cycle_dataset(self, loader):
         """Do a cycle of training or validation."""
+        # 启用自动异常检测，以便在训练过程中更容易发现潜在的错误
         torch.autograd.set_detect_anomaly(True)
+        # 根据loader的训练模式（training或validation），设置actor的模式
         self.actor.train(loader.training)
+        # 根据loader的训练模式，设置是否启用梯度计算
         torch.set_grad_enabled(loader.training)
 
         self._init_timing()

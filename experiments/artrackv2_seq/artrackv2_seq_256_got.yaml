@@ -37,8 +37,8 @@ MODEL:
   RANGE: 2
   EXTENSION: 3
   PRENUM: 7
-  PRETRAIN_FILE: "mae_pretrain_vit_base.pth"
-  PRETRAIN_PTH: ""
+  PRETRAIN_FILE: "ARTrack-v2-B-256-GOT.pth.tar"
+  PRETRAIN_PTH: "./pretrained_models/ARTrack-v2-B-256-GOT.pth.tar"
   EXTRA_MERGER: False
   RETURN_INTER: False
   DECODER:

@@ -175,6 +175,7 @@ class MaskDecoder(nn.Module):
 
 		crop_bboxes = box_xywh_to_cxywh(gt_bboxes)
 		crop_sz = torch.sqrt(gt_bboxes[:, 2] * gt_bboxes[:, 3]) * 2.0
+		# any errors here?
 		crop_sz = torch.clamp(crop_sz, min=0., max=1.)
 		crop_bboxes[:, 2] = crop_bboxes[:, 3] = crop_sz
 

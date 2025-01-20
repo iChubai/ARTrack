@@ -12,8 +12,15 @@ torch.backends.cudnn.benchmark = False
 
 import _init_paths
 import lib.train.admin.settings as ws_settings
-
-
+local_rank = int(os.environ['LOCAL_RANK']) if 'LOCAL_RANK' in os.environ else 0
+import debugpy
+# try:
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9501))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     pass
 def init_seeds(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -40,6 +47,8 @@ def run_training(script_name, config_name, cudnn_benchmark=True, local_rank=-1, 
     # This is needed to avoid strange crashes related to opencv
     torch.set_num_threads(4)
     cv.setNumThreads(4)
+    
+    torch.autograd.set_detect_anomaly(True) 
 
     torch.backends.cudnn.benchmark = cudnn_benchmark
 
@@ -84,7 +93,7 @@ def main():
     parser.add_argument('--script', type=str, required=True, help='Name of the train script.')
     parser.add_argument('--config', type=str, required=True, help="Name of the config file.")
     parser.add_argument('--cudnn_benchmark', type=bool, default=False, help='Set cudnn benchmark on (1) or off (0) (default is on).')
-    parser.add_argument('--local_rank', default=-1, type=int, help='node rank for distributed training')
+    parser.add_argument('--local_rank', type=int, default=int(os.environ.get('LOCAL_RANK', -1)))
     parser.add_argument('--save_dir', type=str, help='the directory to save checkpoints and logs')
     parser.add_argument('--seed', type=int, default=42, help='seed for random numbers')
     parser.add_argument('--use_lmdb', type=int, choices=[0, 1], default=0)  # whether datasets are in lmdb format
@@ -102,6 +111,7 @@ def main():
         torch.cuda.set_device(args.local_rank)
     else:
         torch.cuda.set_device(0)
+    torch.cuda.empty_cache()  
     run_training(args.script, args.config, cudnn_benchmark=args.cudnn_benchmark,
                  local_rank=args.local_rank, save_dir=args.save_dir, base_seed=args.seed,
                  use_lmdb=args.use_lmdb, script_name_prv=args.script_prv, config_name_prv=args.config_prv,

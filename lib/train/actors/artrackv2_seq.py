@@ -353,8 +353,8 @@ class ARTrackV2SeqActor(BaseActor):
         z_crop = torch.cat(z_crop_list, dim=0)  # Tensor(2*num_seq,3,128,128)
         z_1_crop = torch.cat(z_1_list, dim=0)
         z_2_crop = torch.cat(z_2_list, dim=0)
-        z_2_crop = z_2_crop.squeeze(1).to(self.net.module.backbone.word_embeddings.weight)
-        z_2_feat = self.net.module.backbone.patch_embed(z_2_crop)
+        z_2_crop = z_2_crop.squeeze(1).to(self.net.backbone.word_embeddings.weight)
+        z_2_feat = self.net.backbone.patch_embed(z_2_crop)
 
         out = {'template_images': z_crop, "z_1": z_1_crop, "z_2": z_2_crop, "z_2_feat": z_2_feat}
         return out
