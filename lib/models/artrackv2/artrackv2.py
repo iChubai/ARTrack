@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn.modules.transformer import _get_clones
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from lib.models.artrackv2.fastitpn import fastitpnt, fastitpns, fastitpnb, fastitpnl
+from lib.models.artrackv2.resnet import ARTrackWithResNet
 from lib.models.artrackv2.vit import vit_base_patch16_224, vit_large_patch16_224,vit_small_patch16_224
 from lib.utils.box_ops import box_xyxy_to_cxcywh
 
@@ -123,10 +124,17 @@ def build_artrackv2(cfg, training=True):
         backbone = fastitpnl(pretrained= True,pretrained_type='pretrained_models/fast_itpn_large_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE, extension=cfg.MODEL.EXTENSION)
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
+    elif cfg.MODEL.BACKBONE.TYPE.startswith('resnet'):
+        print(f"Using {cfg.MODEL.BACKBONE.TYPE} backbone")
+        backbone = ARTrackWithResNet(cfg)
+        hidden_dim = cfg.MODEL.HIDDEN_DIM
+        patch_start_index = 0 
     else:
         raise NotImplementedError
-   
-    backbone.finetune_track(cfg=cfg, patch_start_index=patch_start_index)
+    if cfg.MODEL.BACKBONE.TYPE.startswith('resnet'):
+        backbone.backbone.finetune_track(cfg=cfg)
+    else:
+         backbone.finetune_track(cfg=cfg, patch_start_index=patch_start_index)
     score_decoder = build_score_decoder(cfg, hidden_dim)
 
     model = ARTrackV2(

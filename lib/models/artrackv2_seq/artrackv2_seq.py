@@ -141,22 +141,22 @@ def build_artrackv2_seq(cfg, training=True):
         patch_start_index = 1
     elif cfg.MODEL.BACKBONE.TYPE == 'fastitpnt':
         print("i use fastitpnt")
-        backbone = fastitpnt(pretrained= True,pretrained_type='pretrained_models/fast_itpn_tiny_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE, extension=cfg.MODEL.EXTENSION, prenum=cfg.MODEL.PRENUM)
+        backbone = fastitpnt(pretrained= True,pretrained_type='pretrained_models/fast_itpn_tiny_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE,  prenum=cfg.MODEL.PRENUM)
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
     elif cfg.MODEL.BACKBONE.TYPE == 'fastitpns':
         print("i use fastitpns")
-        backbone = fastitpns(pretrained= True,pretrained_type='pretrained_models/fast_itpn_small_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE, extension=cfg.MODEL.EXTENSION, prenum=cfg.MODEL.PRENUM)
+        backbone = fastitpns(pretrained= True,pretrained_type='pretrained_models/fast_itpn_small_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE,  prenum=cfg.MODEL.PRENUM)
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
     elif cfg.MODEL.BACKBONE.TYPE == 'fastitpnb':
         print("i use fastitpnb")
-        backbone = fastitpnb(pretrained=True, pretrained_type='pretrained_models/fast_itpn_base_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE, extension=cfg.MODEL.EXTENSION, prenum=cfg.MODEL.PRENUM)
+        backbone = fastitpnb(pretrained=True, pretrained_type='pretrained_models/fast_itpn_base_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE,  prenum=cfg.MODEL.PRENUM)
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
     elif cfg.MODEL.BACKBONE.TYPE == 'fastitpnl': 
         print("i use fastitpnl")
-        backbone = fastitpnl(pretrained= True,pretrained_type='pretrained_models/fast_itpn_large_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE, extension=cfg.MODEL.EXTENSION, prenum=cfg.MODEL.PRENUM)
+        backbone = fastitpnl(pretrained= True,pretrained_type='pretrained_models/fast_itpn_large_1600e_1k.pt', drop_path_rate=cfg.TRAIN.DROP_PATH_RATE, bins=cfg.MODEL.BINS, range=cfg.MODEL.RANGE,  prenum=cfg.MODEL.PRENUM)
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
     else:

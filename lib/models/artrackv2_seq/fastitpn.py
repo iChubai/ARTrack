@@ -17,20 +17,16 @@ import torch.nn as nn
 from timm.models.registry import register_model
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import to_2tuple, drop_path, trunc_normal_,lecun_normal_
-from timm.models.helpers import named_apply
-from lib.models.artrackv2_seq.utils import combine_tokens, recover_tokens
+from timm.models.layers import to_2tuple, drop_path, trunc_normal_
+from lib.models.layers.patch_embed import PatchEmbed as PatchEmbed_true
+from lib.models.artrackv2.utils import combine_tokens, recover_tokens
+from lib.models.artrackv2.vit import Block as final_block
 from torch import Tensor, Size
 from typing import Union, List
 import os
 
 current_file_path = os.getcwd()
 
-# import debugpy
-
-# debugpy.listen(5680)
-# print("Waiting for debugger attach")
-# debugpy.wait_for_client()
 
 def _cfg(url='', **kwargs):
     return {
@@ -44,6 +40,20 @@ def _cfg(url='', **kwargs):
 
 _shape_t = Union[int, List[int], Size]
 
+def generate_square_subsequent_mask(sz, sx, ss):
+    r"""Generate a square mask for the sequence. The masked positions are filled with float('-inf').
+        Unmasked positions are filled with float(0.0).
+    """
+    sum = sz + sx + ss
+    mask = (torch.triu(torch.ones(sum, sum)) == 1).transpose(0, 1)
+    mask[:, :] = 0
+    mask[:int(sz/2), :int(sz/2)] = 1 #template self
+    mask[int(sz/2):sz, int(sz/2):sz] = 1 # dt self
+    mask[int(sz/2):sz, sz:sz+sx] = 1 # dt search
+    mask[int(sz / 2):sz, -1] = 1  # dt search
+    mask[sz:sz+sx, :sz+sx] = 1 # sr dt-t-sr
+    mask[sz+sx:, :] = 1 # co dt-t-sr-co
+    return ~mask
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
@@ -528,6 +538,10 @@ class ConvPatchEmbed(nn.Module):
             self.norm = None
 
     def forward(self, x, bool_masked_pos=None, mask_token=None):
+        """
+        input: x: B, C, H, W
+        output: x: B, num_patches, inner_patches, inner_patches, embed_dim
+        """
         B, C, H, W = x.shape
         x = self.proj(x)
         if self.stop_grad_conv1:
@@ -670,7 +684,6 @@ class Fast_iTPN(nn.Module):
                  patch_norm=False, num_classes=1000, use_mean_pooling=False,
                  init_scale=0.01,
                  cls_token=False,
-                 distilled = False,
                  grad_ckpt=False,
                  stop_grad_conv1=False,
                  use_abs_pos_emb=True,
@@ -683,13 +696,11 @@ class Fast_iTPN(nn.Module):
                  deepnorm=False,
                  subln=False,
                  swiglu=False,
-                 naiveswiglu=False,
-                 token_type_indicate=False,
                  bins = 400,
                  range_time = 2,
+                 naiveswiglu=False,
+                 token_type_indicate=False,
                  prenum = 7,
-                 extension = 3,
-                 weight_init = '',
                  **kwargs):
         super().__init__()
         self.search_size = search_size
@@ -727,10 +738,9 @@ class Fast_iTPN(nn.Module):
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         else:
             self.cls_token = None
-        self.dist_token = nn.Parameter(torch.zeros(1,1,embed_dim)) if distilled else None
         if use_abs_pos_emb:
             if cls_token:
-                self.pos_embed = nn.Parameter(torch.zeros(1,self.num_patches_search+self.num_patches_template + 1, embed_dim))
+                self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
             else:
                 self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches_search+self.num_patches_template, embed_dim))
         else:
@@ -752,11 +762,28 @@ class Fast_iTPN(nn.Module):
             assert self.rel_pos_bias is None
             self.rel_pos_bias = DecoupledRelativePositionBias(window_size=self.patch_embed.patch_shape,
                                                               num_heads=num_heads)
-
+        self.bins = bins
+        self.range = range_time
+        self.word_embeddings = nn.Embedding(self.bins*self.range + 6,embed_dim,padding_idx=self.bins*self.range+4,max_norm=None,norm_type = 2.0)
         self.subln = subln
         self.swiglu = swiglu
         self.naiveswiglu = naiveswiglu
 
+        # self.pos_embed_z0 = None
+        # self.pos_embed_z1 = None
+        # self.pos_embed_x = None
+        self.prev_position_embeddings = nn.Embedding(prenum * 4,embed_dim)
+        self.position_embeddings = nn.Embedding(
+            5, embed_dim)
+        nn.init.kaiming_normal_(self.word_embeddings.weight.data)
+        trunc_normal_(self.position_embeddings.weight.data,std=.02)
+        self.patch_embed_true = PatchEmbed_true(img_size=self.search_size, patch_size=patch_size, in_chans=48,
+                                          embed_dim=self.embed_dim)
+        self.output_bias = torch.nn.Parameter(torch.zeros(self.bins * self.range + 6))
+        final_depth = 3
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, final_depth)]
+        self.final_blocks = nn.Sequential(*[final_block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=nn.GELU)for i in range(final_depth)])
         self.build_blocks(
             depths=[depth_stage1, depth_stage2, depth],
             dims=mlvl_dims,
@@ -779,20 +806,11 @@ class Fast_iTPN(nn.Module):
             naiveswiglu=naiveswiglu,
             convmlp=convmlp,
         )
-        embed_layer = PatchEmbed if not convmlp else ConvPatchEmbed
+        self.img_size = [224, 224]
         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
         self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
         self.head = nn.Identity()
-        self.bins = bins
-        self.cat_mode = 'direct'
-        self.img_size = [224,224]
-        in_channel = embed_dim
-        self.range = range_time
-        self.word_embeddings = nn.Embedding(self.bins * self.range + 6,in_channel,padding_idx=self.bins*self.range+4,max_norm = 1,norm_type= 2.0)
-        self.position_embeddings = nn.Embedding(5,in_channel)
-        self.output_bias = torch.nn.Parameter(torch.zeros(self.bins*self.range + 6))
-        self.prev_position_embeddings = nn.Embedding(prenum *4,in_channel)
-        
+ 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=.02)
         if self.cls_token is not None:
@@ -806,7 +824,7 @@ class Fast_iTPN(nn.Module):
         if isinstance(self.head, nn.Linear):
             self.head.weight.data.mul_(init_scale)
             self.head.bias.data.mul_(init_scale)
-        # self.init_weights(weight_init)
+
     def build_blocks(self,
                      depths=[3, 3, 24],
                      dims={'4': 128 // 4, '8': 256, '16': 512},
@@ -944,51 +962,7 @@ class Fast_iTPN(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-    def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
-        """ ViT weight initialization
-        * When called without n, head_bias, jax_impl args it will behave exactly the same
-        as my original init for compatibility with prev hparam / downstream use cases (ie DeiT).
-        * When called w/ valid n (module name) and jax_impl=True, will (hopefully) match JAX impl
-        """
-        if isinstance(module, nn.Linear):
-            if name.startswith('head'):
-                nn.init.zeros_(module.weight)
-                nn.init.constant_(module.bias, head_bias)
-            elif name.startswith('pre_logits'):
-                lecun_normal_(module.weight)
-                nn.init.zeros_(module.bias)
-            else:
-                if jax_impl:
-                    nn.init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        if 'mlp' in name:
-                            nn.init.normal_(module.bias, std=1e-6)
-                        else:
-                            nn.init.zeros_(module.bias)
-                else:
-                    trunc_normal_(module.weight, std=.02)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-        elif jax_impl and isinstance(module, nn.Conv2d):
-            # NOTE conv was left to pytorch default in my original init
-            lecun_normal_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
-            nn.init.zeros_(module.bias)
-            nn.init.ones_(module.weight)
-    def init_weights(self, mode=''):
-        assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
-        head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
-        trunc_normal_(self.pos_embed, std=.02)
-        if self.dist_token is not None:
-            trunc_normal_(self.dist_token, std=.02)
-        if mode.startswith('jax'):
-            # leave cls token as zeros to match jax impl
-            named_apply(partial(self._init_vit_weights, head_bias=head_bias, jax_impl=True), self)
-        else:
-            trunc_normal_(self.cls_token, std=.02)
-            self.apply(self._init_vit_weights)
+
     def get_num_layers(self):
         return len(self.blocks)
 
@@ -1009,240 +983,178 @@ class Fast_iTPN(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
-    def create_mask(self, image, image_anno):
-        height = image.size(2)
-        width = image.size(3)
+    # def create_mask(self, image, image_anno):
+    #     height = image.size(2)
+    #     width = image.size(3)
 
-        # Extract bounding box coordinates
-        x0 = (image_anno[:, 0] * width).unsqueeze(1)
-        y0 = (image_anno[:, 1] * height).unsqueeze(1)
-        w = (image_anno[:, 2] * width).unsqueeze(1)
-        h = (image_anno[:, 3] * height).unsqueeze(1)
+    #     # Extract bounding box coordinates
+    #     x0 = (image_anno[:, 0] * width).unsqueeze(1)
+    #     y0 = (image_anno[:, 1] * height).unsqueeze(1)
+    #     w = (image_anno[:, 2] * width).unsqueeze(1)
+    #     h = (image_anno[:, 3] * height).unsqueeze(1)
 
-        # Generate pixel indices
-        x_indices = torch.arange(width, device=image.device)
-        y_indices = torch.arange(height, device=image.device)
+    #     # Generate pixel indices
+    #     x_indices = torch.arange(width, device=image.device)
+    #     y_indices = torch.arange(height, device=image.device)
 
-        # Create masks for x and y coordinates within the bounding boxes
-        x_mask = ((x_indices >= x0) & (x_indices < x0 + w)).float()
-        y_mask = ((y_indices >= y0) & (y_indices < y0 + h)).float()
+    #     # Create masks for x and y coordinates within the bounding boxes
+    #     x_mask = ((x_indices >= x0) & (x_indices < x0 + w)).float()
+    #     y_mask = ((y_indices >= y0) & (y_indices < y0 + h)).float()
 
-        # Combine x and y masks to get final mask
-        mask = x_mask.unsqueeze(1) * y_mask.unsqueeze(2) # (b,h,w)
+    #     # Combine x and y masks to get final mask
+    #     mask = x_mask.unsqueeze(1) * y_mask.unsqueeze(2) # (b,h,w)
 
-        return mask
-    def generate_square_subsequent_mask(sz, sx, ss):
-        r"""Generate a square mask for the sequence. The masked positions are filled with float('-inf').
-            Unmasked positions are filled with float(0.0).
-        """
-        # 0 means mask, 1 means visible
-        sum = sz + sx + ss
-        mask = (torch.triu(torch.ones(sum, sum)) == 1).transpose(0, 1)
-        mask[:, :] = 0
-        mask[:int(sz/2), :int(sz/2)] = 1 #template self
-        mask[int(sz/2):sz, int(sz/2):sz] = 1 # dt self
-        mask[int(sz/2):sz, sz:sz+sx] = 1 # dt search
-        mask[int(sz / 2):sz, -1] = 1  # dt search
-        mask[sz:sz+sx, :sz+sx] = 1 # sr dt-t-sr
-        mask[sz+sx:, :] = 1 # co dt-t-sr-co
-        return ~mask
-    def finetune_track(self, cfg, patch_start_index=1):
-        search_size = to_2tuple(cfg.DATA.SEARCH.SIZE)
-        template_size = to_2tuple(cfg.DATA.TEMPLATE.SIZE)
-        new_patch_size = cfg.MODEL.BACKBONE.STRIDE
+    #     return mask
 
-        self.cat_mode = cfg.MODEL.BACKBONE.CAT_MODE
-        self.return_inter = cfg.MODEL.RETURN_INTER
-        self.add_sep_seg = cfg.MODEL.BACKBONE.SEP_SEG
+    # def prepare_tokens_with_masks(self, template_list, search_list, template_anno_list):
+        # num_template = len(template_list)
+        # num_search = len(search_list)
 
-        # resize patch embedding
-        if new_patch_size != self.patch_size:
-            print('Inconsistent Patch Size With The Pretrained Weights, Interpolate The Weight!')
-            old_patch_embed = {}
-            for name, param in self.patch_embed.named_parameters():
-                if 'weight' in name:
-                    param = nn.functional.interpolate(param, size=(new_patch_size, new_patch_size),
-                                                      mode='bicubic', align_corners=False)
-                    param = nn.Parameter(param)
-                old_patch_embed[name] = param
-            self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=new_patch_size, in_chans=3,
-                                          embed_dim=self.embed_dim)
-            self.patch_embed.proj.bias = old_patch_embed['proj.bias']
-            self.patch_embed.proj.weight = old_patch_embed['proj.weight']
+    #     z = torch.stack(template_list, dim=1)  # (b,n,c,h,w)
+    #     z = z.view(-1, *z.size()[2:])  # (bn,c,h,w)
+    #     x = torch.stack(search_list, dim=1)  # (b,n,c,h,w)
+    #     x = x.view(-1, *x.size()[2:])  # (bn,c,h,w)
+    #     z_anno = torch.stack(template_anno_list, dim=1)  # (b,n,4)
+    #     z_anno = z_anno.view(-1, *z_anno.size()[2:])  # (bn,4)
+    #     if self.token_type_indicate:
+    #         # generate the indicate_embeddings for z
+    #         z_indicate_mask = self.create_mask(z, z_anno)
+    #         z_indicate_mask = z_indicate_mask.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size, self.patch_size) # to match the patch embedding
+    #         z_indicate_mask = z_indicate_mask.mean(dim=(3,4)).flatten(1) # elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
+    #         template_background_token = self.template_background_token.unsqueeze(0).unsqueeze(1).expand(z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
+    #         template_foreground_token = self.template_foreground_token.unsqueeze(0).unsqueeze(1).expand(z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
+    #         weighted_foreground = template_foreground_token * z_indicate_mask.unsqueeze(-1)
+    #         weighted_background = template_background_token * (1 - z_indicate_mask.unsqueeze(-1))
+    #         z_indicate = weighted_foreground + weighted_background
 
-        # for patch embedding
-        patch_pos_embed = self.pos_embed[:, patch_start_index:, :]
-        patch_pos_embed = patch_pos_embed.transpose(1, 2)
-        B, E, Q = patch_pos_embed.shape
-        P_H, P_W = self.img_size[0] // self.patch_size, self.img_size[1] // self.patch_size
-        Q = patch_pos_embed.shape[-1]
-        if Q != P_H * P_W:
-             patch_pos_embed = patch_pos_embed[:, :, patch_start_index:patch_start_index + P_H * P_W]
-        patch_pos_embed = patch_pos_embed.view(B, E, P_H, P_W)
-        
-        # for search region
-        H, W = search_size
-        new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
-        search_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
-                                                           align_corners=False)
-        search_patch_pos_embed = search_patch_pos_embed.flatten(2).transpose(1, 2)
+    #     z = self.patch_embed(z)
+    #     x = self.patch_embed(x)
+    #     # forward stage1&2
+    #     if not self.convmlp and self.stop_grad_conv1:
+    #         x = x.detach() * 0.9 + x * 0.1
 
-        # for template region
-        H, W = template_size
-        new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
-        template_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
-                                                             align_corners=False)
-        template_patch_pos_embed = template_patch_pos_embed.flatten(2).transpose(1, 2)
+    #     for blk in self.blocks[:-self.num_main_blocks]:
+    #         z = checkpoint.checkpoint(blk, z, use_reentrant=False) if self.grad_ckpt else blk(z)  # bn,c,h,w
+    #         x = checkpoint.checkpoint(blk, x, use_reentrant=False) if self.grad_ckpt else blk(x)  # bn,c,h,w
 
-        self.pos_embed_z = nn.Parameter(template_patch_pos_embed)
-        self.pos_embed_z0 = nn.Parameter(template_patch_pos_embed)
-        self.pos_embed_z1 = nn.Parameter(template_patch_pos_embed)
-        self.pos_embed_x = nn.Parameter(search_patch_pos_embed)
+    #     x = x.flatten(2).transpose(1, 2)  # bn,l,c
+    #     z = z.flatten(2).transpose(1, 2)
 
-        # for cls token (keep it but not used)
-        if self.cls_token and patch_start_index > 0:
-            cls_pos_embed = self.pos_embed[:, 0:1, :]
-            self.cls_pos_embed = nn.Parameter(cls_pos_embed)
+    #     if self.cls_token is not None:
+    #         cls_tokens = self.cls_token.expand(B, -1, -1)
+    #         x = torch.cat([cls_tokens, x], dim=1)
+    #     if self.pos_embed is not None:
+    #         x = x + self.pos_embed[:, :self.num_patches_search, :]
+    #         z = z + self.pos_embed[:, self.num_patches_search:, :]
 
-        # separate token and segment token
-        if self.add_sep_seg:
-            self.template_segment_pos_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-            self.template_segment_pos_embed = trunc_normal_(self.template_segment_pos_embed, std=.02)
-            self.search_segment_pos_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-            self.search_segment_pos_embed = trunc_normal_(self.search_segment_pos_embed, std=.02)
+    #     if self.token_type_indicate:
+    #         # generate the indicate_embeddings for x
+    #         x_indicate = self.search_token.unsqueeze(0).unsqueeze(1).expand(x.size(0), x.size(1), self.embed_dim)
+    #         # add indicate_embeddings to z and x
+    #         x = x + x_indicate
+    #         z = z + z_indicate
 
-        # self.cls_token = None
-        # self.pos_embed = None
 
-        if self.return_inter:
-            for i_layer in self.fpn_stage:
-                if i_layer != 11:
-                    norm_layer = partial(nn.LayerNorm, eps=1e-6)
-                    layer = norm_layer(self.embed_dim)
-                    layer_name = f'norm{i_layer}'
-                    self.add_module(layer_name, layer)
-    def prepare_tokens_with_masks(self, template_list, search_list, template_anno_list):
-        num_template = len(template_list)
-        num_search = len(search_list)
-
-        z = torch.stack(template_list, dim=1)  # (b,n,c,h,w)
-        z = z.view(-1, *z.size()[2:])  # (bn,c,h,w)
-        x = torch.stack(search_list, dim=1)  # (b,n,c,h,w)
-        x = x.view(-1, *x.size()[2:])  # (bn,c,h,w)
-        z_anno = torch.stack(template_anno_list, dim=1)  # (b,n,4)
-        z_anno = z_anno.view(-1, *z_anno.size()[2:])  # (bn,4)
-        if self.token_type_indicate:
-            # generate the indicate_embeddings for z
-            z_indicate_mask = self.create_mask(z, z_anno)
-            z_indicate_mask = z_indicate_mask.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size, self.patch_size) # to match the patch embedding
-            z_indicate_mask = z_indicate_mask.mean(dim=(3,4)).flatten(1) # elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
-            template_background_token = self.template_background_token.unsqueeze(0).unsqueeze(1).expand(z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
-            template_foreground_token = self.template_foreground_token.unsqueeze(0).unsqueeze(1).expand(z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
-            weighted_foreground = template_foreground_token * z_indicate_mask.unsqueeze(-1)
-            weighted_background = template_background_token * (1 - z_indicate_mask.unsqueeze(-1))
-            z_indicate = weighted_foreground + weighted_background
-
-        z = self.patch_embed(z)
+        # z = z.view(-1, num_template, z.size(-2), z.size(-1))  # b,n,l,c
+        # z = z.reshape(z.size(0), -1, z.size(-1))  # b,l,c
+        # x = x.view(-1, num_search, x.size(-2), x.size(-1))
+        # x = x.reshape(x.size(0), -1, x.size(-1))
+        # xz = torch.cat([x, z], dim=1)
+        # return xz
+    # def forward_features(self, template_list, search_list,template_anno_list):
+    #     xz = self.prepare_tokens_with_masks(template_list, search_list, template_anno_list)
+    #     xz = self.pos_drop(xz)
+    #     return xz
+    def forward_features(self,z_0,z_1,x,identity,seqs_input):
+        B_x,C_x,H_x,W_x = x.shape
+        B_z,C_z,H_z,W_z = z_0.shape
         x = self.patch_embed(x)
+        z_0 = self.patch_embed(z_0) 
+        z_1 = self.patch_embed(z_1) 
+
         # forward stage1&2
         if not self.convmlp and self.stop_grad_conv1:
             x = x.detach() * 0.9 + x * 0.1
-
         for blk in self.blocks[:-self.num_main_blocks]:
-            z = checkpoint.checkpoint(blk, z, use_reentrant=False) if self.grad_ckpt else blk(z)  # bn,c,h,w
+            z_0 = checkpoint.checkpoint(blk, z_0, use_reentrant=False) if self.grad_ckpt else blk(z_0)  # bn,c,h,w
+            z_1 = checkpoint.checkpoint(blk, z_1, use_reentrant=False) if self.grad_ckpt else blk(z_1)  # bn,c,h,w
             x = checkpoint.checkpoint(blk, x, use_reentrant=False) if self.grad_ckpt else blk(x)  # bn,c,h,w
-
-        x = x.flatten(2).transpose(1, 2)  # bn,l,c
-        z = z.flatten(2).transpose(1, 2)
-
+        
+        x = x.flatten(2).transpose(1,2)
+        z_0 = z_0.flatten(2).transpose(1,2)
+        z_1 = z_1.flatten(2).transpose(1,2)
+  
         if self.cls_token is not None:
-            cls_tokens = self.cls_token.expand(B, -1, -1)
+            cls_tokens = self.cls_token.expand(B_x,-1,-1)
             x = torch.cat([cls_tokens, x], dim=1)
         if self.pos_embed is not None:
             x = x + self.pos_embed[:, :self.num_patches_search, :]
-            z = z + self.pos_embed[:, self.num_patches_search:, :]
-
-        if self.token_type_indicate:
-            # generate the indicate_embeddings for x
-            x_indicate = self.search_token.unsqueeze(0).unsqueeze(1).expand(x.size(0), x.size(1), self.embed_dim)
-            # add indicate_embeddings to z and x
-            x = x + x_indicate
-            z = z + z_indicate
-
-
-        z = z.view(-1, num_template, z.size(-2), z.size(-1))  # b,n,l,c
-        z = z.reshape(z.size(0), -1, z.size(-1))  # b,l,c
-        x = x.view(-1, num_search, x.size(-2), x.size(-1))
-        x = x.reshape(x.size(0), -1, x.size(-1))
-        xz = torch.cat([x, z], dim=1)
-        return xz
-    def forward_features(self, z_0, z_1_feat, x, identity, seqs_input):
+            z_0 = z_0 + self.pos_embed[:, self.num_patches_search:, :]
+            z_1 = z_1 + self.pos_embed[:, self.num_patches_search:, :]
+        
+        x = x + self.pos_drop(x)
+        z_0 = z_0 + self.pos_drop(z_0)
+        z_1 = z_1 + self.pos_drop(z_1)
+        
         share_weight = self.word_embeddings.weight.T
         out_list = []
 
-        x0 = self.bins * self.range
-        y0 = self.bins * self.range + 1
-        x1 = self.bins * self.range + 2
-        y1 = self.bins * self.range + 3
-        score = self.bins * self.range + 5
+        x0 = self.bins*self.range
+        y0 = self.bins*self.range + 1
+        x1 = self.bins*self.range + 2
+        y1 = self.bins*self.range + 3
+        score = self.bins*self.range + 5
 
-        B, H, W = x.shape[0], x.shape[2], x.shape[3]
-
-        command = torch.cat([torch.ones((B, 1)).to(x) * x0, torch.ones((B, 1)).to(x) * y0,
-                       torch.ones((B, 1)).to(x) * x1,
-                       torch.ones((B, 1)).to(x) * y1,
-                       torch.ones((B, 1)).to(x) * score], dim=1)
+        command= torch.cat([torch.ones(B_x,1).to(x)*x0,torch.ones(B_x,1).to(x)*y0,torch.ones(B_x,1).to(x)*x1,torch.ones(B_x,1).to(x)*y1,torch.ones(B_x,1).to(x)*score],dim = 1)
+ 
         trajectory = seqs_input
         command = command.to(trajectory)
-        seqs_input_ = torch.cat([trajectory, command], dim=1)
-        
-        seqs_input_ = seqs_input_.to(torch.int64).to(x.device)
+
+        seqs_input = torch.cat([trajectory, command], dim=1)
+
+        seqs_input = seqs_input.to(torch.int64).to(x.device)
         output_x_feat = x.clone()
-        tgt = self.word_embeddings(seqs_input_).permute(1, 0, 2)
-        
+
+        tgt = self.word_embeddings(seqs_input).premute(1,0,2)
+
         x = self.patch_embed(x)
         z_0 = self.patch_embed(z_0)
-        z_1 = z_1_feat
+        z_1 = z_1
 
         len_x = x.shape[1]
-        len_z = z_0.shape[1] + z_1.shape[1]
-        len_seq = seqs_input_.shape[1]
+        len_z = z_0.shape[1]+z_1.shape[1]
+        len_seq = seqs_input.shape[1]
 
-        z_0 += identity[:, 0, :].repeat(B, self.pos_embed_z.shape[1], 1)
-        z_1 += identity[:, 1, :].repeat(B, self.pos_embed_z.shape[1], 1)
+        z_0 += identity[:, 0, :].repeat(B_z, z_0.shape[1], 1)
+        z_1 += identity[:, 1, :].repeat(B_z, z_1.shape[1], 1)
 
-        x += identity[:, 2, :].repeat(B, self.pos_embed_x.shape[1], 1)
+        x += identity[:, 2, :].repeat(B_x, x.shape[1], 1)
 
         query_command_embed_ = self.position_embeddings.weight.unsqueeze(1)
         prev_embed_ = self.prev_position_embeddings.weight.unsqueeze(1)
-        query_seq_embed = torch.cat([prev_embed_, query_command_embed_], dim=0)
-
-        query_seq_embed = query_seq_embed.repeat(1, B, 1)
-
-        tgt = tgt.transpose(0, 1)
-        query_seq_embed = query_seq_embed.transpose(0, 1)
+        query_seq_embed = torch.cat([query_command_embed_, prev_embed_], dim=0)
         
-        z_0 += self.pos_embed_z0
-        z_1 += self.pos_embed_z1
-        x += self.pos_embed_x
+        query_seq_embed = query_seq_embed.repeat(1, B_x, 1)
 
-        mask = self.generate_square_subsequent_mask(len_z, len_x, len_seq).to(tgt.device)
+        tgt = tgt.transpose(0,11)
 
-        tgt += query_seq_embed[:, :tgt.shape[1]]
+        query_seq_embed = query_seq_embed.transpose(0,1)
+
+        mask = generate_square_subsequent_mask(len_z,len_x,len_seq).to(tgt.device)
+
+        tgt +=query_seq_embed[:,:tgt.shape[1]]
 
         z = torch.cat((z_0, z_1), dim=1)
 
-        zx = combine_tokens(z, x, mode=self.cat_mode)
-        zxs = torch.cat((zx, tgt), dim=1)
+        zx = combine_tokens(z,x,mode = self.cat_mode)
+        zxs = torch.cat((zx,tgt),dim=1)
 
-        zxs = self.pos_drop(zxs)
+        for blk in self.blocks[-self.num_main_blocks: ]:
+            zxs = checkpoint.checkpoint(blk, zxs, use_reentrant=False) if self.grad_ckpt else blk(zxs)  # bn,c,h,w
+        
+        zxs = self.norm(zxs)
 
-        for j, blk in enumerate(self.blocks):
-            zxs = blk(zxs, padding_mask=mask)
-        for j, blk in enumerate(self.extension):
-            zxs = blk(zxs, padding_mask=mask)
-
-        lens_z_single = self.pos_embed_z.shape[1]
+        lens_z_single = z_0.shape[1]
 
         z_0_feat = zxs[:, :lens_z_single]
         z_1_feat = zxs[:, lens_z_single:lens_z_single*2]
@@ -1272,12 +1184,130 @@ class Fast_iTPN(nn.Module):
         output = {'seqs': seqs_output, 'class': values, 'feat': temp, "state": "val/test", "x_feat": output_x_feat.detach(), "seq_feat": seq_feat}
 
         return output, z_0_feat, z_1_feat, x_feat, score_feat
-    # def forward_features(self, template_list, search_list,template_anno_list):
-    #     xz = self.prepare_tokens_with_masks(template_list, search_list, template_anno_list)
-    #     xz = self.pos_drop(xz)
-    #     return xz
+        # seqs_input = seqs_input.to(torch.int64).to(x.device)
+        # tgt = self.word_embeddings(seqs_input).permute(1, 0, 2)
+        # query_embed = self.position_embeddings.weight.unsqueeze(1)
+        # query_embed = query_embed.repeat(1, B_x, 1)
 
-    def forward(self, z_0, z_1_feat, x, identity, seqs_input, **kwargs):
+        # tgt = tgt.transpose(0, 1)
+        # query_embed = query_embed.transpose(0, 1)
+        # len_x = x.shape[1]
+        # len_z = z_0.shape[1] + z_1.shape[1]
+        # len_seq = seqs_input.shape[1]
+
+        # mask = generate_square_subsequent_mask(len_z, len_x, len_seq).to(tgt.device)
+
+        # tgt += query_embed
+        
+        # z_0 += identity[:, 0, :].repeat(B_z, z_0.shape[1], 1)
+        # z_1 += identity[:, 1, :].repeat(B_z, z_1.shape[1], 1)
+
+        # x += identity[:, 2, :].repeat(B_x, x.shape[1], 1)
+
+        # z = torch.cat((z_0, z_1), dim=1)
+
+        # x = combine_tokens(z, x, mode=self.cat_mode)
+        # x = torch.cat((x, tgt), dim=1)
+        
+        
+        rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
+        for blk in self.blocks[-self.num_main_blocks:]:
+            x = checkpoint.checkpoint(blk, x, rel_pos_bias) if self.grad_ckpt else blk(x, rel_pos_bias)
+
+        x = self.norm(x)
+
+        # for i, blk in enumerate(self.final_blocks):
+        #     x = blk(x, padding_mask=mask)
+        x_out = self.norm(x[:, -5:-1])
+        score_feat = x[:, -1]
+
+        lens_z = z_0.shape[1]
+        lens_x = x.shape[1]
+
+        z_0_feat = x[:, :lens_z]
+        z_1_feat = x[:, lens_z:lens_z*2]
+        x_feat = x[:, lens_z*2:lens_z*2+lens_x]
+
+        #x = recover_tokens(x, lens_z, lens_x, mode=self.cat_mode)
+        at = torch.matmul(x_out, share_weight)
+        at = at + self.output_bias
+        at = at[:, -4:]
+        at = at.transpose(0, 1)
+        output = {'feat': at, 'score_feat':score_feat, "state": "train"}
+
+        return output, z_0_feat, z_1_feat, x_feat
+
+    def finetune_track(self, cfg, patch_start_index=1):
+
+        search_size = to_2tuple(cfg.DATA.SEARCH.SIZE)
+        template_size = to_2tuple(cfg.DATA.TEMPLATE.SIZE)
+        new_patch_size = cfg.MODEL.BACKBONE.STRIDE
+
+        self.cat_mode = cfg.MODEL.BACKBONE.CAT_MODE
+        self.return_inter = cfg.MODEL.RETURN_INTER
+        self.add_sep_seg = cfg.MODEL.BACKBONE.SEP_SEG
+
+        # resize patch embedding
+        if new_patch_size != self.patch_size:
+            print('Inconsistent Patch Size With The Pretrained Weights, Interpolate The Weight!')
+            old_patch_embed = {}
+            for name, param in self.patch_embed.named_parameters():
+                if 'weight' in name:
+                    param = nn.functional.interpolate(param, size=(new_patch_size, new_patch_size),
+                                                      mode='bicubic', align_corners=False)
+                    param = nn.Parameter(param)
+                old_patch_embed[name] = param
+            self.patch_embed = PatchEmbed_true(img_size=self.img_size, patch_size=new_patch_size, in_chans=3,
+                                          embed_dim=self.embed_dim)
+            self.patch_embed.proj.bias = old_patch_embed['proj.bias']
+            self.patch_embed.proj.weight = old_patch_embed['proj.weight']
+
+        # for patch embedding
+        patch_pos_embed = self.pos_embed[:, patch_start_index:, :]
+        patch_pos_embed = patch_pos_embed.transpose(1, 2)
+        B, E, Q = patch_pos_embed.shape
+        P_H, P_W = self.img_size[0] // self.patch_size, self.img_size[1] // self.patch_size
+        Q = patch_pos_embed.shape[-1]
+        if Q != P_H * P_W:
+             patch_pos_embed = patch_pos_embed[:, :, patch_start_index:patch_start_index + P_H * P_W]
+        patch_pos_embed = patch_pos_embed.view(B, E, P_H, P_W)
+        # for search region
+        H, W = search_size
+        new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
+        search_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
+                                                           align_corners=False)
+        search_patch_pos_embed = search_patch_pos_embed.flatten(2).transpose(1, 2)
+
+        # for template region
+        H, W = template_size
+        new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
+        template_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
+                                                             align_corners=False)
+        template_patch_pos_embed = template_patch_pos_embed.flatten(2).transpose(1, 2)
+        # pos_embed_z0_tensor = torch.randn(4)
+        # pos_embed_z1_tensor = torch.randn(4)
+        # pos_embed_x_tensor = torch.randn(16)
+        # self.pos_embed_z0 = nn.Parameter(pos_embed_z0_tensor)
+        # self.pos_embed_z1 = nn.Parameter(pos_embed_z1_tensor)
+        # self.pos_embed_x = nn.Parameter(pos_embed_x_tensor)
+
+        # for cls token (keep it but not used)
+        if self.cls_token and patch_start_index > 0:
+            cls_pos_embed = self.pos_embed[:, 0:1, :]
+            self.cls_pos_embed = nn.Parameter(cls_pos_embed)
+
+        # separate token and segment token
+        if self.add_sep_seg:
+            self.template_segment_pos_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+            self.template_segment_pos_embed = trunc_normal_(self.template_segment_pos_embed, std=.02)
+            self.search_segment_pos_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+            self.search_segment_pos_embed = trunc_normal_(self.search_segment_pos_embed, std=.02)
+
+   
+       
+         
+
+    def forward(self, z_0, z_1, x, identity, seqs_input, **kwargs):
         """
         Joint feature extraction and relation modeling for the basic ViT backbone.
         Args:
@@ -1288,10 +1318,10 @@ class Fast_iTPN(nn.Module):
             x (torch.Tensor): merged template and search region feature, [B, L_z+L_x, C]
             attn : None
         """
-        output = self.forward_features(z_0, z_1_feat, x, identity, seqs_input)
+        output = self.forward_features(z_0, z_1, x, identity, seqs_input)
 
         return output
-    
+
 def load_pretrained(model, checkpoint, pos_type):
     if "module" in checkpoint.keys():
         # adjust position encoding
@@ -1341,8 +1371,10 @@ def load_pretrained(model, checkpoint, pos_type):
 
 
 @register_model
-def fastitpnt(pretrained=False, pos_type="interpolate", pretrain_type="",extension= 3,bins = 400,range = 2, prenum =7, **kwargs):
+def fastitpnt(pretrained=False, pos_type="interpolate", pretrain_type="",bins = 400,range = 2, prenum =7,search_size = 256,template_size = 128, **kwargs):
     model = Fast_iTPN(
+        search_size=search_size,
+        template_size=template_size,
         patch_size=16, embed_dim=384, depth_stage1=1, depth_stage2=1, depth=12, num_heads=6, bridge_mlp_ratio=3.,
         mlp_ratio=3., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
         convmlp=True,
@@ -1352,7 +1384,6 @@ def fastitpnt(pretrained=False, pos_type="interpolate", pretrain_type="",extensi
         bins = bins,
         range_time = range,
         prenum= prenum,
-        extension=extension,
         **kwargs)
     model.default_cfg = _cfg()
     #TODO :fix the pretrain_path
@@ -1364,7 +1395,7 @@ def fastitpnt(pretrained=False, pos_type="interpolate", pretrain_type="",extensi
 
 
 @register_model
-def fastitpns(pretrained=False, pos_type="interpolate", pretrain_type="",extension= 3,bins = 400,range = 2, prenum =7, **kwargs):
+def fastitpns(pretrained=False, pos_type="interpolate", pretrain_type="", **kwargs):
     model = Fast_iTPN(
         patch_size=16, embed_dim=384, depth_stage1=2, depth_stage2=2, depth=20, num_heads=6, bridge_mlp_ratio=3.,
         mlp_ratio=3., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -1372,10 +1403,6 @@ def fastitpns(pretrained=False, pos_type="interpolate", pretrain_type="",extensi
         naiveswiglu=True,
         subln=True,
         pos_type=pos_type,
-        bins = bins,
-        range_time = range,
-        prenum= prenum,
-        extension=extension,
         **kwargs)
     model.default_cfg = _cfg()
     pretrain_path = current_file_path +  pretrain_type
@@ -1385,7 +1412,7 @@ def fastitpns(pretrained=False, pos_type="interpolate", pretrain_type="",extensi
     return model
 
 @register_model
-def fastitpnb(pretrained=False,pos_type="interpolate",pretrain_type="", extension= 3,bins = 400,range = 2, prenum =7,**kwargs):
+def fastitpnb(pretrained=False,pos_type="interpolate",pretrain_type="",**kwargs):
     model = Fast_iTPN(
         patch_size=16, embed_dim=512, depth_stage1=3, depth_stage2=3, depth=24, num_heads=8, bridge_mlp_ratio=3.,
         mlp_ratio=3., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -1393,10 +1420,6 @@ def fastitpnb(pretrained=False,pos_type="interpolate",pretrain_type="", extensio
         naiveswiglu=True,
         subln=True,
         pos_type = pos_type,
-        bins = bins,
-        range_time = range,
-        prenum= prenum,
-        extension=extension,
         **kwargs)
     model.default_cfg = _cfg()
     pretrain_path = current_file_path + pretrain_type
@@ -1408,7 +1431,7 @@ def fastitpnb(pretrained=False,pos_type="interpolate",pretrain_type="", extensio
 
 
 @register_model
-def fastitpnl(pretrained=False,pos_type="interpolate",pretrain_type="", extension= 3,bins = 400,range = 2, prenum =7,**kwargs):
+def fastitpnl(pretrained=False,pos_type="interpolate",pretrain_type="", **kwargs):
     model = Fast_iTPN(
         patch_size=16, embed_dim=768, depth_stage1=2, depth_stage2=2, depth=40, num_heads=12, bridge_mlp_ratio=3.,
         mlp_ratio=3., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -1416,10 +1439,6 @@ def fastitpnl(pretrained=False,pos_type="interpolate",pretrain_type="", extensio
         naiveswiglu=True,
         subln=True,
         pos_type="interpolate",
-        bins = bins,
-        range_time = range,
-        prenum= prenum,
-        extension=extension,
         **kwargs)
     model.default_cfg = _cfg()
     pretrain_path = current_file_path + pretrain_type

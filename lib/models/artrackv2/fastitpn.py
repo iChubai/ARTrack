@@ -1108,7 +1108,7 @@ class Fast_iTPN(nn.Module):
         len_seq = seqs_input.shape[1]
 
         mask = generate_square_subsequent_mask(len_z, len_x, len_seq).to(tgt.device)
-
+        
         tgt += query_embed
         
         z_0 += identity[:, 0, :].repeat(B_z, z_0.shape[1], 1)
@@ -1124,7 +1124,7 @@ class Fast_iTPN(nn.Module):
         
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
         for blk in self.blocks[-self.num_main_blocks:]:
-            x = checkpoint.checkpoint(blk, x, rel_pos_bias) if self.grad_ckpt else blk(x, rel_pos_bias)
+            x = checkpoint.checkpoint(blk, x, rel_pos_bias,attn_mask=mask) if self.grad_ckpt else blk(x, rel_pos_bias,attn_mask=mask)
 
         x = self.norm(x)
 
@@ -1176,22 +1176,7 @@ class Fast_iTPN(nn.Module):
             x = x + self.pos_embed[:, :self.num_patches_search, :]
             z_0 = z_0 + self.pos_embed[:, self.num_patches_search:, :]
             z_1 = z_1 + self.pos_embed[:, self.num_patches_search:, :]
-        
-        # x = x.view(B_x,C_x,-1)
-        # x_hw = x.shape[-1]
-        # x_h = x_hw // torch.ceil(torch.sqrt(x_hw))
-        # x_w = x_hw // x_h
-        # x = x.reshape(B_x,C_x,x_h,x_w)
-        # z_0 = z_0.view(B_z,C_z,-1)
-        # z_1 = z_1.view(B_z,C_z,-1)
-        # z_0_hw = z_0.shape[-1]
-        # z_0_h = z_0_hw // torch.ceil(torch.sqrt(z_0_hw))
-        # z_0_w = z_0_hw // z_0_h
-        # z_0 = z_0.reshape(B_z,C_z,z_0_h,z_0_w)
-        # z_1_hw = z_1.shape[-1]
-        # z_1_h = z_1_hw // torch.ceil(torch.sqrt(z_1_hw))
-        # z_1_w = z_1_hw // z_1_h
-        # z_1 = z_1.reshape(B_z,C_z,z_1_h,z_1_w)
+
         share_weight = self.word_embeddings.weight.T
         out_list = []
 
@@ -1215,10 +1200,10 @@ class Fast_iTPN(nn.Module):
         len_z = z_0.shape[1] + z_1.shape[1]
         len_seq = seqs_input.shape[1]
 
-        z_0 += identity[:, 0, :].repeat(B_z, self.pos_embed_z0.shape[1], 1)
-        z_1 += identity[:, 1, :].repeat(B_z, self.pos_embed_z0.shape[1], 1)
+        z_0 += identity[:, 0, :].repeat(B_z, z_0.shape[1], 1)
+        z_1 += identity[:, 1, :].repeat(B_z, z_1.shape[1], 1)
 
-        x += identity[:, 2, :].repeat(B_x, self.pos_embed_x.shape[1], 1)
+        x += identity[:, 2, :].repeat(B_x, x.shape[1], 1)
 
         query_pos_embed = self.position_embeddings.weight.unsqueeze(1)
         query_pos_embed = query_pos_embed.repeat(1, B_x, 1)
@@ -1236,12 +1221,13 @@ class Fast_iTPN(nn.Module):
         zxs = torch.cat((zx, tgt), dim=1)
 
         zxs = self.pos_drop(zxs)
+        rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
+        for blk in self.blocks[-self.num_main_blocks:]:
+            zxs = checkpoint.checkpoint(blk, zxs, rel_pos_bias) if self.grad_ckpt else blk(zxs, rel_pos_bias)
 
-        for j, blk in enumerate(self.final_blocks):
-            zxs = blk(zxs, padding_mask=mask)
 
-        lens_z_single = self.pos_embed_z0.shape[1]
-        lens_x = self.pos_embed_x.shape[1]
+        lens_z_single = z_0.shape[1]
+        lens_x = x.shape[1]
 
         z_0_feat = zxs[:, :lens_z_single]
         z_1_feat = zxs[:, lens_z_single:lens_z_single * 2]
